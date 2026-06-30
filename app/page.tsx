@@ -1,121 +1,1281 @@
 'use client';
+
 import { useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { supabase, hasSupabaseConfig } from '../lib/supabase';
-import { thaiHolidays2026 } from '../lib/holidays';
-import type { Task, TaskStatus, Priority, Shipment, ShipmentStatus } from '../lib/types';
+import { deleteRow, insertRow, selectRows, updateRow } from '../services/db';
 
-const taskStatuses: TaskStatus[] = ['Not Started','Progress','Waiting','Review','Done','Paused','Cancelled'];
-const priorities: Priority[] = ['Critical','High','Medium','Low','Someday'];
-const shipStatuses: ShipmentStatus[] = ['Supplier Confirm','Production','Ready','Booking','Container Loading','ETD','At Sea','ETA','Customs','Warehouse','Completed','Delayed','Cancelled'];
-const statusTH: Record<string,string> = {'Not Started':'ยังไม่เริ่ม',Progress:'กำลังดำเนินการ',Waiting:'รอข้อมูล / รอคนอื่น',Review:'รอตรวจสอบ',Done:'เสร็จสิ้น',Paused:'พักไว้',Cancelled:'ยกเลิก'};
-const shipTH: Record<string,string> = {'Supplier Confirm':'เมืองนอกคอนเฟิร์ม',Production:'กำลังผลิต',Ready:'สินค้าพร้อม',Booking:'จองเรือ', 'Container Loading':'โหลดตู้', ETD:'เรือออก', 'At Sea':'อยู่ระหว่างเดินเรือ', ETA:'ถึงท่า', Customs:'เคลียร์ศุลกากร', Warehouse:'เข้าโกดัง', Completed:'เสร็จสิ้น', Delayed:'ล่าช้า', Cancelled:'ยกเลิก'};
-const today = () => new Date().toISOString().slice(0,10);
-const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
-const emptyTask = (): Task => ({id:uid(),title:'',project:'',category:'',priority:'Medium',status:'Not Started',start_date:today(),due_date:'',description:'',progress:0,people:'',tags:'',links:'',created_at:new Date().toISOString(),updated_at:new Date().toISOString(),completed_at:null,history:['สร้างงาน']});
-const emptyShipment = (): Shipment => ({id:uid(),name:'',tag:'',po:'',pi:'',supplier:'',forwarder:'',shipping_line:'',vessel:'',voyage:'',container_no:'',origin_port:'',destination_port:'',supplier_confirm_date:'',forwarder_confirm_date:'',planned_ship_date:'',etd:'',eta:'',actual_departure:'',actual_arrival:'',warehouse_date:'',status:'Supplier Confirm',remark:'',links:'',created_at:new Date().toISOString(),updated_at:new Date().toISOString(),history:['สร้าง Shipment']});
+type Task = {
+  id?: string;
+  title: string;
+  project?: string;
+  category?: string;
+  priority?: string;
+  status?: string;
+  start_date?: string;
+  due_date?: string;
+  description?: string;
+  progress?: number;
+  owner?: string;
+  links?: string;
+  checklist?: string;
+  comments?: string;
+  history?: string;
+  created_at?: string;
+};
 
-export default function Home(){
-  const router = useRouter();
-  const [ready,setReady]=useState(false);
-  const [userEmail,setUserEmail]=useState('Local Mode');
-  const [tab,setTab]=useState('Dashboard');
-  const [tasks,setTasks]=useState<Task[]>([]);
-  const [ships,setShips]=useState<Shipment[]>([]);
-  const [taskModal,setTaskModal]=useState<Task|null>(null);
-  const [shipModal,setShipModal]=useState<Shipment|null>(null);
-  const [query,setQuery]=useState('');
-  const [filterStatus,setFilterStatus]=useState('All');
-  const [calMonth,setCalMonth]=useState(new Date().toISOString().slice(0,7));
-  const [cloud,setCloud]=useState(false);
-  const [isAdmin,setIsAdmin]=useState(false);
+type Shipment = {
+  id?: string;
+  name: string;
+  tag?: string;
+  supplier?: string;
+  po_no?: string;
+  pi_no?: string;
+  forwarder?: string;
+  shipping_line?: string;
+  status?: string;
+  vessel?: string;
+  voyage_no?: string;
+  container_no?: string;
+  origin_port?: string;
+  destination_port?: string;
+  etd?: string;
+  eta?: string;
+  actual_departure?: string;
+  actual_arrival?: string;
+  warehouse_date?: string;
+  remark?: string;
+  timeline?: string;
+  links?: string;
+  created_at?: string;
+};
 
-  useEffect(()=>{ init(); },[]);
-  async function init(){
-    const localMode = localStorage.getItem('toey_local_mode') === '1';
-    if(hasSupabaseConfig && supabase && !localMode){
-      const {data:{session}} = await supabase.auth.getSession();
-      if(!session){ router.push('/login'); return; }
-      setUserEmail(session.user.email || 'User'); setCloud(true);
-      const {data:profile,error:profileError}=await supabase.from('profiles').select('approval_status,role').eq('id',session.user.id).single();
-      if(profileError || !profile){ router.push('/pending'); return; }
-      if(profile.approval_status !== 'approved'){ router.push('/pending'); return; }
-      setIsAdmin(profile.role === 'admin');
-      await loadCloud();
-    }else{ loadLocal(); }
-    setReady(true);
+type ShipmentEvent = {
+  id?: string;
+  shipment_id?: string;
+  event_date?: string;
+  event_type?: string;
+  title?: string;
+  detail?: string;
+  created_at?: string;
+};
+
+type LinkRow = {
+  id?: string;
+  title: string;
+  url?: string;
+  ref_type?: string;
+  ref_name?: string;
+  remark?: string;
+  created_at?: string;
+};
+
+const PASS = 'toey1234';
+
+const statuses = [
+  'ยังไม่เริ่ม',
+  'กำลังดำเนินการ',
+  'รอข้อมูล / รอคนอื่น',
+  'รอตรวจสอบ',
+  'เสร็จสิ้น',
+  'พักไว้',
+  'ยกเลิก'
+];
+
+const priorities = ['Critical', 'High', 'Medium', 'Low', 'Someday'];
+
+const shipmentEventTypes = [
+  'Supplier Confirm',
+  'รับของแล้ว',
+  'เลื่อนวันส่ง',
+  'เลื่อน ETD',
+  'เลื่อน ETA',
+  'เรือออกแล้ว',
+  'เรือถึงแล้ว',
+  'เข้าโกดัง',
+  'Customs',
+  'Delay',
+  'หมายเหตุ'
+];
+
+const holidays = [
+  ['2026-01-01', 'วันขึ้นปีใหม่'],
+  ['2026-01-02', 'วันหยุดพิเศษ'],
+  ['2026-02-11', 'วันมาฆบูชา'],
+  ['2026-04-06', 'วันจักรี'],
+  ['2026-04-13', 'วันสงกรานต์'],
+  ['2026-04-14', 'วันสงกรานต์'],
+  ['2026-04-15', 'วันสงกรานต์'],
+  ['2026-05-01', 'วันแรงงาน'],
+  ['2026-05-05', 'วันฉัตรมงคล'],
+  ['2026-06-01', 'วันวิสาขบูชา'],
+  ['2026-07-27', 'วันอาสาฬหบูชา'],
+  ['2026-07-28', 'วันเฉลิมพระชนมพรรษา ร.10'],
+  ['2026-08-12', 'วันแม่แห่งชาติ'],
+  ['2026-10-13', 'วันคล้ายวันสวรรคต ร.9'],
+  ['2026-10-16', 'วันหยุดพิเศษ'],
+  ['2026-10-23', 'วันปิยมหาราช'],
+  ['2026-12-05', 'วันพ่อแห่งชาติ'],
+  ['2026-12-10', 'วันรัฐธรรมนูญ'],
+  ['2026-12-31', 'วันสิ้นปี']
+];
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function toDateKey(date: Date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function diffDays(d?: string) {
+  if (!d) return 9999;
+  const a = new Date(today()).getTime();
+  const b = new Date(d).getTime();
+  return Math.ceil((b - a) / 86400000);
+}
+
+function emptyTask(): Task {
+  return {
+    title: '',
+    project: '',
+    category: '',
+    priority: 'Medium',
+    status: 'ยังไม่เริ่ม',
+    start_date: today(),
+    due_date: '',
+    description: '',
+    progress: 0,
+    owner: '',
+    links: '',
+    checklist: '',
+    comments: '',
+    history: ''
+  };
+}
+
+function emptyShip(): Shipment {
+  return {
+    name: '',
+    tag: '',
+    supplier: '',
+    po_no: '',
+    pi_no: '',
+    forwarder: '',
+    shipping_line: '',
+    status: 'Pending',
+    vessel: '',
+    voyage_no: '',
+    container_no: '',
+    origin_port: '',
+    destination_port: '',
+    etd: '',
+    eta: '',
+    actual_departure: '',
+    actual_arrival: '',
+    warehouse_date: '',
+    remark: '',
+    timeline: 'Supplier Confirm > Production > Booking > ETD > At Sea > ETA > Customs > Warehouse',
+    links: ''
+  };
+}
+
+function emptyEvent(shipmentId = ''): ShipmentEvent {
+  return {
+    shipment_id: shipmentId,
+    event_date: today(),
+    event_type: 'หมายเหตุ',
+    title: '',
+    detail: ''
+  };
+}
+
+export default function App() {
+  const [access, setAccess] = useState(false);
+  const [pass, setPass] = useState('');
+  const [tab, setTab] = useState('Dashboard');
+
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [ships, setShips] = useState<Shipment[]>([]);
+  const [events, setEvents] = useState<ShipmentEvent[]>([]);
+  const [links, setLinks] = useState<LinkRow[]>([]);
+
+  const [loading, setLoading] = useState(false);
+  const [modal, setModal] = useState<'task' | 'ship' | 'event' | 'link' | null>(null);
+
+  const [editTask, setEditTask] = useState<Task>(emptyTask());
+  const [editShip, setEditShip] = useState<Shipment>(emptyShip());
+  const [editEvent, setEditEvent] = useState<ShipmentEvent>(emptyEvent());
+  const [editLink, setEditLink] = useState<LinkRow>({
+    title: '',
+    url: '',
+    ref_type: 'General',
+    ref_name: '',
+    remark: ''
+  });
+
+  const [widgetMin, setWidgetMin] = useState(false);
+  const [scale, setScale] = useState(100);
+
+  useEffect(() => {
+    setAccess(localStorage.getItem('toey_pass') === 'yes');
+    const sc = Number(localStorage.getItem('toey_scale') || 100);
+    setScale(sc);
+    document.documentElement.style.setProperty('--scale', String(sc / 100));
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty('--scale', String(scale / 100));
+    localStorage.setItem('toey_scale', String(scale));
+  }, [scale]);
+
+  useEffect(() => {
+    if (access) loadAll();
+  }, [access]);
+
+  async function loadAll() {
+    setLoading(true);
+    const [t, s, e, l] = await Promise.all([
+      selectRows('tasks'),
+      selectRows('shipments'),
+      selectRows('shipment_events'),
+      selectRows('workspace_links')
+    ]);
+    setTasks((t.data || []) as Task[]);
+    setShips((s.data || []) as Shipment[]);
+    setEvents((e.data || []) as ShipmentEvent[]);
+    setLinks((l.data || []) as LinkRow[]);
+    setLoading(false);
   }
-  function loadLocal(){
-    setTasks(JSON.parse(localStorage.getItem('toey_tasks')||'[]'));
-    setShips(JSON.parse(localStorage.getItem('toey_shipments')||'[]'));
-  }
-  function saveLocal(nt:Task[], ns:Shipment[]){
-    localStorage.setItem('toey_tasks',JSON.stringify(nt)); localStorage.setItem('toey_shipments',JSON.stringify(ns));
-  }
-  async function loadCloud(){
-    if(!supabase)return;
-    const {data:t}=await supabase.from('tasks').select('*').order('created_at',{ascending:false});
-    const {data:s}=await supabase.from('shipments').select('*').order('created_at',{ascending:false});
-    setTasks((t||[]) as Task[]); setShips((s||[]) as Shipment[]);
-  }
-  async function persist(nt:Task[], ns:Shipment[]){
-    setTasks(nt); setShips(ns); saveLocal(nt,ns);
-    if(cloud && supabase){
-      await supabase.from('tasks').upsert(nt as any);
-      await supabase.from('shipments').upsert(ns as any);
+
+  function enter() {
+    if (pass === PASS) {
+      localStorage.setItem('toey_pass', 'yes');
+      setAccess(true);
+    } else {
+      alert('รหัสผ่านไม่ถูกต้อง');
     }
   }
-  async function deleteTask(id:string){
-    if(!confirm('ลบงานนี้หรือไม่?'))return;
-    const nt=tasks.filter(x=>x.id!==id); await persist(nt,ships); if(cloud&&supabase) await supabase.from('tasks').delete().eq('id',id);
-  }
-  async function deleteShip(id:string){
-    if(!confirm('ลบ Shipment นี้หรือไม่?'))return;
-    const ns=ships.filter(x=>x.id!==id); await persist(tasks,ns); if(cloud&&supabase) await supabase.from('shipments').delete().eq('id',id);
-  }
-  async function saveTask(t:Task){
-    const old=tasks.find(x=>x.id===t.id); const now=new Date().toLocaleString('th-TH');
-    t.updated_at=new Date().toISOString();
-    if(old && old.status!==t.status){ t.history=[...(old.history||[]),`${now} เปลี่ยนสถานะ ${statusTH[old.status]} → ${statusTH[t.status]}`]; if(t.status==='Done') t.completed_at=new Date().toISOString(); }
-    const nt=old?tasks.map(x=>x.id===t.id?t:x):[t,...tasks]; await persist(nt,ships); setTaskModal(null);
-  }
-  async function quickTaskStatus(id:string,status:TaskStatus){
-    const t=tasks.find(x=>x.id===id); if(!t)return; await saveTask({...t,status});
-  }
-  async function saveShip(s:Shipment){
-    const old=ships.find(x=>x.id===s.id); const now=new Date().toLocaleString('th-TH'); s.updated_at=new Date().toISOString();
-    if(old && old.status!==s.status){ s.history=[...(old.history||[]),`${now} เปลี่ยนสถานะ ${shipTH[old.status]} → ${shipTH[s.status]}`]; }
-    const ns=old?ships.map(x=>x.id===s.id?s:x):[s,...ships]; await persist(tasks,ns); setShipModal(null);
-  }
-  async function signOut(){ localStorage.removeItem('toey_local_mode'); if(supabase) await supabase.auth.signOut(); router.push('/login'); }
-  function exportJSON(){ const blob=new Blob([JSON.stringify({tasks,shipments:ships,exported_at:new Date().toISOString()},null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='toey_workspace_backup.json'; a.click(); }
-  function restoreJSON(e:any){ const file=e.target.files?.[0]; if(!file)return; const reader=new FileReader(); reader.onload=async()=>{try{const d=JSON.parse(String(reader.result)); await persist(d.tasks||[],d.shipments||[]); alert('Restore สำเร็จ');}catch{alert('ไฟล์ไม่ถูกต้อง')}}; reader.readAsText(file); }
 
-  const stats = useMemo(()=>{
-    const open = tasks.filter(t=>!['Done','Cancelled'].includes(t.status)); const td=today(); const soonDate=new Date(); soonDate.setDate(soonDate.getDate()+7); const soon=soonDate.toISOString().slice(0,10);
-    return {open:open.length,today:open.filter(t=>t.due_date===td).length,soon:open.filter(t=>t.due_date&&t.due_date>td&&t.due_date<=soon).length,waiting:open.filter(t=>t.status==='Waiting').length,done:tasks.filter(t=>t.status==='Done').length,shipsActive:ships.filter(s=>!['Completed','Cancelled'].includes(s.status)).length,shipsEta:ships.filter(s=>s.eta&&s.eta>=td&&s.eta<=soon).length};
-  },[tasks,ships]);
-  const shownTasks=tasks.filter(t=>(filterStatus==='All'||t.status===filterStatus)&&[t.title,t.project,t.category,t.description,t.tags,t.people].join(' ').toLowerCase().includes(query.toLowerCase()));
-  const shownShips=ships.filter(s=>[s.name,s.tag,s.po,s.pi,s.supplier,s.vessel,s.container_no,s.remark].join(' ').toLowerCase().includes(query.toLowerCase()));
+  const stats = useMemo(() => {
+    const active = tasks.filter(t => !['เสร็จสิ้น', 'ยกเลิก'].includes(t.status || ''));
 
-  if(!ready) return <div className="main">Loading...</div>;
-  return <div className="app"><aside className="sidebar"><div className="brand">TOEY Workspace</div><div className="sub">Work • Shipment • Calendar</div><div className="nav">{[{k:'Dashboard',l:'🏠 Dashboard'},{k:'My Tasks',l:'✅ My Tasks'},{k:'Shipments',l:'🚢 Shipment / ของเข้า'},{k:'Calendar',l:'📅 Calendar'},{k:'Files & Links',l:'📎 Files & Links'},{k:'Settings',l:'⚙️ Backup / Settings'}].map(n=><button key={n.k} className={tab===n.k?'active':''} onClick={()=>setTab(n.k)}>{n.l}</button>)}{isAdmin&&<button onClick={()=>router.push('/admin')}>👤 Admin Approval</button>}</div><div style={{marginTop:20}} className="muted">{cloud?'Online Supabase':'Local Mode'}<br/>{userEmail}</div><button className="btn secondary" style={{marginTop:12,width:'100%'}} onClick={signOut}>Log Out</button></aside><main className="main"><div className="topbar"><div><div className="title">{tab}</div><div className="muted">ระบบติดตามงานและของเข้าออนไลน์</div></div><div className="row"><span className="badge">● {cloud?'Online':'Local'}</span><button className="btn orange" onClick={()=>setTaskModal(emptyTask())}>+ เพิ่มงาน</button><button className="btn" onClick={()=>setShipModal(emptyShipment())}>+ Shipment</button></div></div>
-  {tab==='Dashboard'&&<Dashboard stats={stats} tasks={tasks} ships={ships} onStatus={quickTaskStatus} />}
-  {tab==='My Tasks'&&<Tasks tasks={shownTasks} query={query} setQuery={setQuery} filterStatus={filterStatus} setFilterStatus={setFilterStatus} onEdit={setTaskModal} onDelete={deleteTask} onStatus={quickTaskStatus}/>} 
-  {tab==='Shipments'&&<Shipments ships={shownShips} query={query} setQuery={setQuery} onEdit={setShipModal} onDelete={deleteShip}/>} 
-  {tab==='Calendar'&&<Calendar month={calMonth} setMonth={setCalMonth} tasks={tasks} ships={ships}/>} 
-  {tab==='Files & Links'&&<FilesLinks tasks={tasks} ships={ships}/>} 
-  {tab==='Settings'&&<Settings exportJSON={exportJSON} restoreJSON={restoreJSON} cloud={cloud}/>} 
-  {taskModal&&<TaskModal task={taskModal} setTask={setTaskModal} save={saveTask}/>} {shipModal&&<ShipModal ship={shipModal} setShip={setShipModal} save={saveShip}/>} </main></div>
+    return {
+      pending: active.length,
+      today: tasks.filter(t => t.due_date === today()).length,
+      week: tasks.filter(t => {
+        const d = diffDays(t.due_date);
+        return d >= 0 && d <= 7;
+      }).length,
+      waiting: tasks.filter(t => (t.status || '').includes('รอข้อมูล')).length,
+      done: tasks.filter(t => t.status === 'เสร็จสิ้น').length,
+      ship: ships.filter(s => !['Completed', 'Cancelled'].includes(s.status || '')).length
+    };
+  }, [tasks, ships]);
+
+  async function saveTask() {
+    const row = {
+      ...editTask,
+      progress: Number(editTask.progress || 0),
+      history:
+        (editTask.history || '') +
+        `\n${new Date().toLocaleString('th-TH')} บันทึกงาน / สถานะ: ${editTask.status}`
+    };
+
+    if (editTask.id) await updateRow('tasks', editTask.id, row);
+    else await insertRow('tasks', row);
+
+    setModal(null);
+    await loadAll();
+  }
+
+  async function quickStatus(t: Task, status: string) {
+    await updateRow('tasks', t.id!, {
+      status,
+      progress: status === 'เสร็จสิ้น' ? 100 : t.progress,
+      history:
+        (t.history || '') +
+        `\n${new Date().toLocaleString('th-TH')} เปลี่ยนสถานะเป็น ${status}`
+    });
+
+    await loadAll();
+  }
+
+  async function saveShip() {
+    if (editShip.id) await updateRow('shipments', editShip.id, editShip);
+    else await insertRow('shipments', editShip);
+
+    setModal(null);
+    await loadAll();
+  }
+
+  async function saveEvent() {
+    if (!editEvent.shipment_id) {
+      alert('กรุณาเลือก Shipment');
+      return;
+    }
+
+    const row = {
+      shipment_id: editEvent.shipment_id,
+      event_date: editEvent.event_date || today(),
+      event_type: editEvent.event_type || 'หมายเหตุ',
+      title: editEvent.title || editEvent.event_type || 'Shipment Event',
+      detail: editEvent.detail || ''
+    };
+
+    if (editEvent.id) await updateRow('shipment_events', editEvent.id, row);
+    else await insertRow('shipment_events', row);
+
+    const ship = ships.find(s => s.id === editEvent.shipment_id);
+    if (ship?.id) {
+      const patch: any = {};
+      if (row.event_type === 'เลื่อน ETD' && row.event_date) patch.etd = row.event_date;
+      if (row.event_type === 'เลื่อน ETA' && row.event_date) patch.eta = row.event_date;
+      if (row.event_type === 'เรือออกแล้ว' && row.event_date) patch.actual_departure = row.event_date;
+      if (row.event_type === 'เรือถึงแล้ว' && row.event_date) patch.actual_arrival = row.event_date;
+      if (row.event_type === 'เข้าโกดัง' || row.event_type === 'รับของแล้ว') patch.warehouse_date = row.event_date;
+      if (row.event_type === 'รับของแล้ว') patch.status = 'Warehouse';
+      if (row.event_type === 'เลื่อนวันส่ง' || row.event_type === 'Delay') patch.status = 'Delay';
+      if (Object.keys(patch).length > 0) await updateRow('shipments', ship.id, patch);
+    }
+
+    setModal(null);
+    await loadAll();
+  }
+
+  async function saveLink() {
+    if (editLink.id) await updateRow('workspace_links', editLink.id, editLink);
+    else await insertRow('workspace_links', editLink);
+
+    setModal(null);
+    await loadAll();
+  }
+
+  function exportJson() {
+    const blob = new Blob([JSON.stringify({ tasks, ships, events, links }, null, 2)], {
+      type: 'application/json'
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'toey-workspace-backup.json';
+    a.click();
+  }
+
+  if (!access) {
+    return (
+      <div className="login">
+        <div className="loginCard">
+          <h1 style={{ fontSize: 42, margin: '0 0 8px' }}>🧭 TOEY Workspace</h1>
+          <p className="sub">ระบบติดตามงาน Shipment Calendar และไฟล์อ้างอิงออนไลน์</p>
+
+          <label style={{ fontWeight: 900, display: 'block', marginTop: 26 }}>
+            ใส่รหัสผ่านเข้าใช้งาน
+          </label>
+
+          <input
+            type="password"
+            value={pass}
+            onChange={e => setPass(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') enter();
+            }}
+            placeholder="Password"
+            style={{ marginTop: 10 }}
+          />
+
+          <button className="btn orange" style={{ width: '100%', marginTop: 18 }} onClick={enter}>
+            เข้าสู่ระบบ
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <aside
+        className="sidebar"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          minHeight: '100vh'
+        }}
+      >
+        <div className="brand">
+          🧭 TOEY
+          <br />
+          Workspace
+        </div>
+
+        <div className="sub">Online Database v2.2</div>
+
+        <div className="nav">
+          {['Dashboard', 'Tasks', 'Shipments', 'Calendar', 'Files & Links', 'Settings'].map(x => (
+            <button key={x} className={tab === x ? 'active' : ''} onClick={() => setTab(x)}>
+              {x === 'Dashboard'
+                ? '🏠 '
+                : x === 'Tasks'
+                ? '✅ '
+                : x === 'Shipments'
+                ? '🚢 '
+                : x === 'Calendar'
+                ? '📅 '
+                : x === 'Files & Links'
+                ? '📁 '
+                : '⚙️ '}
+              {x}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ marginTop: 'auto' }}>
+          <div className="scaleBox">
+            <button onClick={() => setScale(Math.max(80, scale - 10))}>-</button>
+            <b>{scale}%</b>
+            <button onClick={() => setScale(Math.min(125, scale + 10))}>+</button>
+          </div>
+
+          <div className="sub" style={{ marginBottom: 14 }}>
+            Display Scale
+          </div>
+
+          <button
+            className="btn light"
+            style={{
+              width: '100%',
+              background: '#dc2626',
+              color: '#fff',
+              fontWeight: 800,
+              border: 'none'
+            }}
+            onClick={() => {
+              if (confirm('ต้องการออกจากระบบใช่หรือไม่?')) {
+                localStorage.removeItem('toey_pass');
+                location.reload();
+              }
+            }}
+          >
+            🚪 ออกจากระบบ
+          </button>
+        </div>
+      </aside>
+
+      <main className="main">
+        <div className="topbar">
+          <div>
+            <div className="title">{tab}</div>
+            <div className="sub">
+              {loading ? 'Loading online data...' : 'ข้อมูลเก็บใน Supabase เปิดเครื่องไหนก็เห็นชุดเดียวกัน'}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              className="btn orange"
+              onClick={() => {
+                setEditTask(emptyTask());
+                setModal('task');
+              }}
+            >
+              + เพิ่มงาน
+            </button>
+
+            <button
+              className="btn dark"
+              onClick={() => {
+                setEditShip(emptyShip());
+                setModal('ship');
+              }}
+            >
+              + Shipment
+            </button>
+          </div>
+        </div>
+
+        {tab === 'Dashboard' && (
+          <>
+            <section className="grid kpis">
+              <K label="งานค้าง" v={stats.pending} />
+              <K label="วันนี้" v={stats.today} />
+              <K label="ภายใน 7 วัน" v={stats.week} />
+              <K label="รอข้อมูล" v={stats.waiting} />
+              <K label="Shipment" v={stats.ship} />
+            </section>
+
+            <section className="grid two">
+              <div className="card">
+                <h3>งานล่าสุด</h3>
+                <TaskTable
+                  tasks={tasks.slice(0, 8)}
+                  onEdit={(t: Task) => {
+                    setEditTask(t);
+                    setModal('task');
+                  }}
+                  onDelete={async (t: Task) => {
+                    if (confirm('ลบงาน?')) {
+                      await deleteRow('tasks', t.id!);
+                      loadAll();
+                    }
+                  }}
+                  onStatus={quickStatus}
+                />
+              </div>
+
+              <div className="card">
+                <h3>Shipment ใกล้ถึง</h3>
+                {ships.slice(0, 5).map(s => (
+                  <div className="card" style={{ boxShadow: 'none', marginBottom: 10 }} key={s.id}>
+                    <b>{s.name}</b>
+                    <div className="sub">
+                      {s.tag} • {s.supplier}
+                    </div>
+                    <div>
+                      🚢 {s.vessel || '-'} {s.voyage_no || ''}
+                    </div>
+                    <div>
+                      ETD: {s.etd || '-'} / ETA: {s.eta || '-'}
+                    </div>
+                    <span className="badge b-blue">{s.status}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </>
+        )}
+
+        {tab === 'Tasks' && (
+          <div className="card">
+            <h3>My Tasks</h3>
+            <TaskTable
+              tasks={tasks}
+              onEdit={(t: Task) => {
+                setEditTask(t);
+                setModal('task');
+              }}
+              onDelete={async (t: Task) => {
+                if (confirm('ลบงาน?')) {
+                  await deleteRow('tasks', t.id!);
+                  loadAll();
+                }
+              }}
+              onStatus={quickStatus}
+            />
+          </div>
+        )}
+
+        {tab === 'Shipments' && (
+          <div className="grid">
+            {ships.map(s => (
+              <ShipmentCard
+                key={s.id}
+                shipment={s}
+                events={events.filter(ev => ev.shipment_id === s.id)}
+                onEdit={() => {
+                  setEditShip(s);
+                  setModal('ship');
+                }}
+                onDelete={async () => {
+                  if (confirm('ลบ Shipment?')) {
+                    await deleteRow('shipments', s.id!);
+                    loadAll();
+                  }
+                }}
+                onAddEvent={() => {
+                  setEditEvent(emptyEvent(s.id));
+                  setModal('event');
+                }}
+                onEditEvent={(ev: ShipmentEvent) => {
+                  setEditEvent(ev);
+                  setModal('event');
+                }}
+                onDeleteEvent={async (ev: ShipmentEvent) => {
+                  if (confirm('ลบ Event นี้?')) {
+                    await deleteRow('shipment_events', ev.id!);
+                    loadAll();
+                  }
+                }}
+              />
+            ))}
+          </div>
+        )}
+
+        {tab === 'Calendar' && <Calendar tasks={tasks} ships={ships} events={events} />}
+
+        {tab === 'Files & Links' && (
+          <div className="card">
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <h3>Files & Links</h3>
+              <button
+                className="btn orange"
+                onClick={() => {
+                  setEditLink({
+                    title: '',
+                    url: '',
+                    ref_type: 'General',
+                    ref_name: '',
+                    remark: ''
+                  });
+                  setModal('link');
+                }}
+              >
+                + เพิ่มลิงก์
+              </button>
+            </div>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>ชื่อ</th>
+                  <th>ประเภท</th>
+                  <th>อ้างอิง</th>
+                  <th>Link</th>
+                  <th>หมายเหตุ</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {links.map(l => (
+                  <tr key={l.id}>
+                    <td>{l.title}</td>
+                    <td>{l.ref_type}</td>
+                    <td>{l.ref_name}</td>
+                    <td>{l.url ? <a href={l.url} target="_blank">เปิด</a> : '-'}</td>
+                    <td>{l.remark}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {tab === 'Settings' && (
+          <div className="card">
+            <h3>Settings / Backup</h3>
+            <p>ข้อมูลหลักเก็บใน Supabase Database แล้ว</p>
+
+            <button className="btn dark" onClick={exportJson}>
+              Export Backup JSON
+            </button>
+          </div>
+        )}
+      </main>
+
+      <Summary stats={stats} min={widgetMin} setMin={setWidgetMin} />
+
+      {modal === 'task' && (
+        <TaskModal
+          t={editTask}
+          setT={setEditTask}
+          onClose={() => setModal(null)}
+          onSave={saveTask}
+        />
+      )}
+
+      {modal === 'ship' && (
+        <ShipModal
+          s={editShip}
+          setS={setEditShip}
+          onClose={() => setModal(null)}
+          onSave={saveShip}
+        />
+      )}
+
+      {modal === 'event' && (
+        <ShipmentEventModal
+          ev={editEvent}
+          setEv={setEditEvent}
+          ships={ships}
+          onClose={() => setModal(null)}
+          onSave={saveEvent}
+        />
+      )}
+
+      {modal === 'link' && (
+        <LinkModal
+          l={editLink}
+          setL={setEditLink}
+          onClose={() => setModal(null)}
+          onSave={saveLink}
+        />
+      )}
+    </div>
+  );
 }
-function Dashboard({stats,tasks,ships,onStatus}:any){return <><div className="grid kpi"><K title="งานค้าง" n={stats.open}/><K title="วันนี้" n={stats.today}/><K title="ภายใน 7 วัน" n={stats.soon}/><K title="Waiting" n={stats.waiting}/><K title="Shipment Active" n={stats.shipsActive}/></div><div className="split" style={{marginTop:14}}><div className="card"><div className="between"><h3>งานที่ต้องโฟกัส</h3><span className="muted">Quick Status</span></div><TaskTable tasks={tasks.filter((t:Task)=>!['Done','Cancelled'].includes(t.status)).slice(0,8)} onStatus={onStatus}/></div><div className="card ship-card"><h3>Shipment / เรือใกล้ถึง</h3>{ships.filter((s:Shipment)=>!['Completed','Cancelled'].includes(s.status)).slice(0,6).map((s:Shipment)=><div key={s.id} className="card" style={{boxShadow:'none',marginBottom:8,padding:12}}><b>{s.name||s.tag||'Shipment'}</b><div className="muted">{shipTH[s.status]} • ETD {s.etd||'-'} • ETA {s.eta||'-'}</div><div className="muted">{s.vessel} {s.voyage}</div></div>)}</div></div><div className="compact-widget"><div className="wtop"><b>📋 TOEY Workspace</b><button>ย่อ</button></div><div className="wgrid"><div className="wbox"><span>งานค้าง</span><b>{stats.open}</b></div><div className="wbox"><span>วันนี้</span><b>{stats.today}</b></div><div className="wbox"><span>7 วัน</span><b>{stats.soon}</b></div><div className="wbox"><span>Shipment</span><b>{stats.shipsActive}</b></div></div></div></>}
-function K({title,n}:any){return <div className="card"><div className="muted">{title}</div><div className="num">{n}</div></div>}
-function Tasks(p:any){return <div className="card"><div className="between"><div className="row"><input placeholder="ค้นหางาน..." value={p.query} onChange={(e:any)=>p.setQuery(e.target.value)}/><select value={p.filterStatus} onChange={(e:any)=>p.setFilterStatus(e.target.value)}><option>All</option>{taskStatuses.map(s=><option key={s} value={s}>{statusTH[s]}</option>)}</select></div></div><TaskTable tasks={p.tasks} onEdit={p.onEdit} onDelete={p.onDelete} onStatus={p.onStatus}/></div>}
-function TaskTable({tasks,onEdit,onDelete,onStatus}:any){return <table className="table"><thead><tr><th>Priority</th><th>งาน</th><th>Project</th><th>Deadline</th><th>Status</th><th>Progress</th><th></th></tr></thead><tbody>{tasks.map((t:Task)=><tr key={t.id}><td><span className={`pill priority-${t.priority}`}>{t.priority}</span></td><td><b>{t.title}</b><div className="muted">{t.category}</div></td><td>{t.project}</td><td>{t.due_date||'-'}</td><td><select value={t.status} onChange={e=>onStatus?.(t.id,e.target.value)}>{taskStatuses.map(s=><option key={s} value={s}>{statusTH[s]}</option>)}</select></td><td>{t.progress}%</td><td className="row"><button className="btn secondary" onClick={()=>onEdit?.(t)}>เปิด</button>{onDelete&&<button className="btn warn" onClick={()=>onDelete(t.id)}>ลบ</button>}</td></tr>)}</tbody></table>}
-function Shipments(p:any){return <div className="card"><input placeholder="ค้นหา Shipment, PO, Supplier, Vessel..." value={p.query} onChange={(e:any)=>p.setQuery(e.target.value)}/><table className="table"><thead><tr><th>Shipment</th><th>PO/PI</th><th>Supplier</th><th>Vessel</th><th>ETD</th><th>ETA</th><th>Status</th><th></th></tr></thead><tbody>{p.ships.map((s:Shipment)=><tr key={s.id}><td><b>{s.name}</b><div className="muted">{s.tag}</div></td><td>{s.po}<br/><span className="muted">{s.pi}</span></td><td>{s.supplier}</td><td>{s.vessel}<div className="muted">{s.voyage}</div></td><td>{s.etd||'-'}</td><td>{s.eta||'-'}</td><td><span className="pill">{shipTH[s.status]}</span></td><td className="row"><button className="btn secondary" onClick={()=>p.onEdit(s)}>เปิด</button><button className="btn warn" onClick={()=>p.onDelete(s.id)}>ลบ</button></td></tr>)}</tbody></table></div>}
-function Calendar({month,setMonth,tasks,ships}:any){const [y,m]=month.split('-').map(Number); const first=new Date(y,m-1,1); const days=new Date(y,m,0).getDate(); const blanks=first.getDay(); const cells=[...Array(blanks).fill(0),...Array.from({length:days},(_,i)=>i+1)]; return <div className="card"><div className="row"><input type="month" value={month} onChange={e=>setMonth(e.target.value)}/></div><div className="calendar" style={{marginTop:12}}>{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=><b key={d}>{d}</b>)}{cells.map((d,i)=>{if(!d)return <div key={i}></div>; const date=`${month}-${String(d).padStart(2,'0')}`; return <div className="day" key={date}><div className="d">{d}</div>{thaiHolidays2026[date]&&<div className="event holiday">{thaiHolidays2026[date]}</div>}{tasks.filter((t:Task)=>t.due_date===date).map((t:Task)=><div key={t.id} className="event">Task: {t.title}</div>)}{ships.filter((s:Shipment)=>s.etd===date||s.eta===date||s.warehouse_date===date).map((s:Shipment)=><div key={s.id} className="event">Ship: {s.name||s.tag}</div>)}</div>})}</div></div>}
-function FilesLinks({tasks,ships}:any){const items=[...tasks.map((t:Task)=>({type:'Task',name:t.title,links:t.links})),...ships.map((s:Shipment)=>({type:'Shipment',name:s.name||s.tag,links:s.links}))].filter(x=>x.links); return <div className="card"><h3>Files & Links</h3>{items.map((it:any,i:number)=><div key={i} className="card" style={{boxShadow:'none',marginBottom:8}}><b>{it.type}: {it.name}</b>{it.links.split('\n').map((l:string,idx:number)=><div key={idx}>{l.startsWith('http')?<a href={l} target="_blank">{l}</a>:<span>{l}</span>}</div>)}</div>)}</div>}
-function Settings({exportJSON,restoreJSON,cloud}:any){return <div className="card"><h3>Settings</h3><p>Mode: {cloud?'Online Supabase':'Local Storage'}</p><div className="row"><button className="btn" onClick={exportJSON}>Backup JSON</button><label className="btn secondary">Restore JSON<input type="file" accept=".json" onChange={restoreJSON} style={{display:'none'}}/></label></div><p className="muted">ถ้า Deploy ออนไลน์ ให้ตั้งค่า Environment Variables ใน Vercel และรัน SQL ใน Supabase ก่อนใช้งานจริง</p></div>}
-function TaskModal({task,setTask,save}:any){const t=task; const upd=(k:string,v:any)=>setTask({...t,[k]:v}); async function uploadFile(e:any){const file=e.target.files?.[0]; if(!file)return; if(!supabase){alert('Local Mode: ให้แนบเป็นลิงก์ไฟล์ก่อน'); return;} const path=`tasks/${t.id}/${Date.now()}_${file.name}`; const {error}=await supabase.storage.from('workspace-files').upload(path,file,{upsert:true}); if(error){alert(error.message);return;} const {data}=supabase.storage.from('workspace-files').getPublicUrl(path); upd('links',`${t.links? t.links+'\n':''}${data.publicUrl}`);} return <div className="modal"><div className="modalbox"><div className="between"><h2>{t.title||'เพิ่มงาน'}</h2><button className="btn secondary" onClick={()=>setTask(null)}>ปิด</button></div><div className="form"><F label="ชื่องาน"><input value={t.title} onChange={e=>upd('title',e.target.value)}/></F><F label="Project"><input value={t.project} onChange={e=>upd('project',e.target.value)}/></F><F label="Category"><input value={t.category} onChange={e=>upd('category',e.target.value)}/></F><F label="Priority"><select value={t.priority} onChange={e=>upd('priority',e.target.value)}>{priorities.map(x=><option key={x}>{x}</option>)}</select></F><F label="Status"><select value={t.status} onChange={e=>upd('status',e.target.value)}>{taskStatuses.map(x=><option key={x} value={x}>{statusTH[x]}</option>)}</select></F><F label="Progress %"><input type="number" min="0" max="100" value={t.progress} onChange={e=>upd('progress',Number(e.target.value))}/></F><F label="Start Date"><input type="date" value={t.start_date} onChange={e=>upd('start_date',e.target.value)}/></F><F label="Deadline"><input type="date" value={t.due_date} onChange={e=>upd('due_date',e.target.value)}/></F><F label="ผู้เกี่ยวข้อง"><input value={t.people} onChange={e=>upd('people',e.target.value)}/></F><F label="Tags"><input value={t.tags} onChange={e=>upd('tags',e.target.value)} placeholder="AUKEY, PO, Shipment"/></F><F label="รายละเอียด" full><textarea value={t.description} onChange={e=>upd('description',e.target.value)}/></F><F label="Upload File / Links" full><input type="file" onChange={uploadFile}/><textarea value={t.links} onChange={e=>upd('links',e.target.value)} placeholder="วางลิงก์ Google Drive, Supabase Storage, Shopee, ฯลฯ แยกบรรทัด"/></F></div><div className="split"><div className="card"><h3>History</h3><div className="timeline">{(t.history||[]).map((h:string,i:number)=><div key={i}>{h}</div>)}</div></div><div className="card"><h3>Completion</h3><p className="muted">Completed at: {t.completed_at||'-'}</p></div></div><button className="btn green" onClick={()=>save(t)}>บันทึก</button></div></div>}
-function ShipModal({ship,setShip,save}:any){const s=ship; const upd=(k:string,v:any)=>setShip({...s,[k]:v}); async function uploadFile(e:any){const file=e.target.files?.[0]; if(!file)return; if(!supabase){alert('Local Mode: ให้แนบเป็นลิงก์ไฟล์ก่อน'); return;} const path=`shipments/${s.id}/${Date.now()}_${file.name}`; const {error}=await supabase.storage.from('workspace-files').upload(path,file,{upsert:true}); if(error){alert(error.message);return;} const {data}=supabase.storage.from('workspace-files').getPublicUrl(path); upd('links',`${s.links? s.links+'\n':''}${data.publicUrl}`);} return <div className="modal"><div className="modalbox"><div className="between"><h2>{s.name||'เพิ่ม Shipment'}</h2><button className="btn secondary" onClick={()=>setShip(null)}>ปิด</button></div><div className="form"><F label="Shipment Name"><input value={s.name} onChange={e=>upd('name',e.target.value)} placeholder="Shipment 1 - สั่ง ม.ค. ส่ง ก.พ."/></F><F label="Tag"><input value={s.tag} onChange={e=>upd('tag',e.target.value)} placeholder="SHIP-FEB-01"/></F><F label="PO"><input value={s.po} onChange={e=>upd('po',e.target.value)}/></F><F label="PI"><input value={s.pi} onChange={e=>upd('pi',e.target.value)}/></F><F label="Supplier"><input value={s.supplier} onChange={e=>upd('supplier',e.target.value)}/></F><F label="Forwarder"><input value={s.forwarder} onChange={e=>upd('forwarder',e.target.value)}/></F><F label="Shipping Line"><input value={s.shipping_line} onChange={e=>upd('shipping_line',e.target.value)}/></F><F label="Status"><select value={s.status} onChange={e=>upd('status',e.target.value)}>{shipStatuses.map(x=><option key={x} value={x}>{shipTH[x]}</option>)}</select></F><F label="Vessel"><input value={s.vessel} onChange={e=>upd('vessel',e.target.value)}/></F><F label="Voyage No."><input value={s.voyage} onChange={e=>upd('voyage',e.target.value)}/></F><F label="Container No."><input value={s.container_no} onChange={e=>upd('container_no',e.target.value)}/></F><F label="Origin Port"><input value={s.origin_port} onChange={e=>upd('origin_port',e.target.value)}/></F><F label="Destination Port"><input value={s.destination_port} onChange={e=>upd('destination_port',e.target.value)}/></F><F label="เมืองนอกคอนเฟิร์ม"><input type="date" value={s.supplier_confirm_date} onChange={e=>upd('supplier_confirm_date',e.target.value)}/></F><F label="ชิปปิ้งยืนยันรับ"><input type="date" value={s.forwarder_confirm_date} onChange={e=>upd('forwarder_confirm_date',e.target.value)}/></F><F label="กำหนดวันส่ง"><input type="date" value={s.planned_ship_date} onChange={e=>upd('planned_ship_date',e.target.value)}/></F><F label="ETD เรือออก"><input type="date" value={s.etd} onChange={e=>upd('etd',e.target.value)}/></F><F label="ETA เรือถึงท่า"><input type="date" value={s.eta} onChange={e=>upd('eta',e.target.value)}/></F><F label="Actual Departure"><input type="date" value={s.actual_departure} onChange={e=>upd('actual_departure',e.target.value)}/></F><F label="Actual Arrival"><input type="date" value={s.actual_arrival} onChange={e=>upd('actual_arrival',e.target.value)}/></F><F label="Warehouse Receive"><input type="date" value={s.warehouse_date} onChange={e=>upd('warehouse_date',e.target.value)}/></F><F label="Remark" full><textarea value={s.remark} onChange={e=>upd('remark',e.target.value)}/></F><F label="Upload File / Links" full><input type="file" onChange={uploadFile}/><textarea value={s.links} onChange={e=>upd('links',e.target.value)}/></F></div><div className="card"><h3>History</h3><div className="timeline">{(s.history||[]).map((h:string,i:number)=><div key={i}>{h}</div>)}</div></div><button className="btn green" onClick={()=>save(s)}>บันทึก</button></div></div>}
-function F({label,children,full}:any){return <div className={`field ${full?'full':''}`}><label>{label}</label>{children}</div>}
+
+function K({ label, v }: { label: string; v: number }) {
+  return (
+    <div className="card kpi-card">
+      <div className="kpiLabel">{label}</div>
+      <div className="kpiVal">{v}</div>
+    </div>
+  );
+}
+
+function TaskTable({ tasks, onEdit, onDelete, onStatus }: any) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Priority</th>
+          <th>งาน</th>
+          <th>Project</th>
+          <th>Deadline</th>
+          <th>Status</th>
+          <th>Progress</th>
+          <th></th>
+        </tr>
+      </thead>
+
+      <tbody>
+        {tasks.map((t: Task) => (
+          <tr key={t.id}>
+            <td>
+              <span className="badge b-orange">{t.priority}</span>
+            </td>
+            <td>
+              <b>{t.title}</b>
+              <div className="sub">{t.description}</div>
+            </td>
+            <td>{t.project}</td>
+            <td>{t.due_date}</td>
+            <td>
+              <select value={t.status} onChange={e => onStatus(t, e.target.value)}>
+                {statuses.map(s => (
+                  <option key={s}>{s}</option>
+                ))}
+              </select>
+            </td>
+            <td>{t.progress || 0}%</td>
+            <td>
+              <button className="btn light" onClick={() => onEdit(t)}>
+                รายละเอียด
+              </button>{' '}
+              <button className="btn light" onClick={() => onDelete(t)}>
+                ลบ
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function ShipmentCard({ shipment, events, onEdit, onDelete, onAddEvent, onEditEvent, onDeleteEvent }: any) {
+  const sortedEvents = [...events].sort((a, b) => String(b.event_date).localeCompare(String(a.event_date)));
+
+  return (
+    <div className="card">
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+        <div>
+          <h3 style={{ marginTop: 0 }}>🚢 {shipment.name}</h3>
+          <div className="sub">
+            {shipment.tag} • PO {shipment.po_no || '-'} • PI {shipment.pi_no || '-'}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <button className="btn orange" onClick={onAddEvent}>+ Event</button>
+          <button className="btn light" onClick={onEdit}>แก้ไข</button>
+          <button className="btn light" onClick={onDelete}>ลบ</button>
+        </div>
+      </div>
+
+      <div className="grid three">
+        <div>
+          <b>Supplier</b>
+          <br />
+          {shipment.supplier || '-'}
+          <br />
+          <b>Forwarder</b>
+          <br />
+          {shipment.forwarder || '-'}
+        </div>
+
+        <div>
+          <b>Vessel / Voyage</b>
+          <br />
+          {shipment.vessel || '-'} / {shipment.voyage_no || '-'}
+          <br />
+          <b>Container</b>
+          <br />
+          {shipment.container_no || '-'}
+        </div>
+
+        <div>
+          <b>ETD / ETA</b>
+          <br />
+          {shipment.etd || '-'} / {shipment.eta || '-'}
+          <br />
+          <b>Warehouse</b>
+          <br />
+          {shipment.warehouse_date || '-'}
+        </div>
+      </div>
+
+      <p>
+        <b>Timeline:</b> {shipment.timeline}
+      </p>
+
+      <p className="sub">{shipment.remark}</p>
+
+      <div style={{ marginTop: 14 }}>
+        <h4 style={{ margin: '0 0 10px' }}>Shipment Events / ประวัติการเปลี่ยนแปลง</h4>
+        {sortedEvents.length === 0 && <div className="sub">ยังไม่มี Event</div>}
+        {sortedEvents.map((ev: ShipmentEvent) => (
+          <div
+            key={ev.id}
+            style={{
+              border: '1px solid #e5e7eb',
+              borderRadius: 14,
+              padding: 12,
+              marginBottom: 8,
+              background: '#f8fafc'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+              <div>
+                <b>{ev.event_date || '-'}</b> • <span className="badge b-blue">{ev.event_type}</span>
+                <div style={{ marginTop: 6 }}><b>{ev.title}</b></div>
+                <div className="sub">{ev.detail}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn light" onClick={() => onEditEvent(ev)}>แก้</button>
+                <button className="btn light" onClick={() => onDeleteEvent(ev)}>ลบ</button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TaskModal({ t, setT, onClose, onSave }: any) {
+  return (
+    <div className="modalBg">
+      <div className="modal">
+        <h2>รายละเอียดงาน</h2>
+
+        <div className="form">
+          <input placeholder="ชื่องาน" value={t.title} onChange={e => setT({ ...t, title: e.target.value })} />
+          <input placeholder="Project" value={t.project || ''} onChange={e => setT({ ...t, project: e.target.value })} />
+          <input placeholder="Category" value={t.category || ''} onChange={e => setT({ ...t, category: e.target.value })} />
+          <input placeholder="ผู้เกี่ยวข้อง" value={t.owner || ''} onChange={e => setT({ ...t, owner: e.target.value })} />
+
+          <select value={t.priority} onChange={e => setT({ ...t, priority: e.target.value })}>
+            {priorities.map(p => (
+              <option key={p}>{p}</option>
+            ))}
+          </select>
+
+          <select value={t.status} onChange={e => setT({ ...t, status: e.target.value })}>
+            {statuses.map(s => (
+              <option key={s}>{s}</option>
+            ))}
+          </select>
+
+          <input type="date" value={t.start_date || ''} onChange={e => setT({ ...t, start_date: e.target.value })} />
+          <input type="date" value={t.due_date || ''} onChange={e => setT({ ...t, due_date: e.target.value })} />
+          <input type="number" placeholder="Progress %" value={t.progress || 0} onChange={e => setT({ ...t, progress: Number(e.target.value) })} />
+
+          <textarea className="full" placeholder="รายละเอียด" value={t.description || ''} onChange={e => setT({ ...t, description: e.target.value })} />
+          <textarea className="full" placeholder="Checklist เช่น ขอราคา / ทำ PO / ส่งบัญชี" value={t.checklist || ''} onChange={e => setT({ ...t, checklist: e.target.value })} />
+          <textarea className="full" placeholder="Links / Files reference" value={t.links || ''} onChange={e => setT({ ...t, links: e.target.value })} />
+          <textarea className="full" placeholder="Comment" value={t.comments || ''} onChange={e => setT({ ...t, comments: e.target.value })} />
+          <textarea className="full" placeholder="History" value={t.history || ''} onChange={e => setT({ ...t, history: e.target.value })} />
+        </div>
+
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <button className="btn light" onClick={onClose}>ปิด</button>{' '}
+          <button className="btn orange" onClick={onSave}>บันทึก</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ShipModal({ s, setS, onClose, onSave }: any) {
+  const fields = [
+    { key: 'name', label: 'ชื่อ Shipment', type: 'text', placeholder: 'เช่น Shipment 1 - สั่ง ก.ค. ส่ง ส.ค.' },
+    { key: 'tag', label: 'Tag / รอบ Shipment', type: 'text', placeholder: 'เช่น SHIP-AUG-01' },
+    { key: 'supplier', label: 'Supplier', type: 'text', placeholder: 'เช่น AUKEY / EarFun' },
+    { key: 'po_no', label: 'เลขที่ PO', type: 'text', placeholder: 'เช่น MBCEFPO2600001' },
+    { key: 'pi_no', label: 'เลขที่ PI', type: 'text', placeholder: 'เช่น PI20260001' },
+    { key: 'forwarder', label: 'Shipping Agent / Forwarder', type: 'text', placeholder: 'เช่น ABC Logistics' },
+    { key: 'shipping_line', label: 'สายเรือ', type: 'text', placeholder: 'เช่น COSCO / Evergreen' },
+    { key: 'status', label: 'สถานะ Shipment', type: 'text', placeholder: 'เช่น At Sea / Customs / Warehouse' },
+    { key: 'vessel', label: 'ชื่อเรือ', type: 'text', placeholder: 'เช่น COSCO STAR' },
+    { key: 'voyage_no', label: 'Voyage No.', type: 'text', placeholder: 'เช่น V.026E' },
+    { key: 'container_no', label: 'Container No.', type: 'text', placeholder: 'เช่น TGHU1234567' },
+    { key: 'origin_port', label: 'ต้นทาง (Origin Port)', type: 'text', placeholder: 'เช่น Shenzhen / Ningbo' },
+    { key: 'destination_port', label: 'ปลายทาง (Destination Port)', type: 'text', placeholder: 'เช่น Bangkok Port / Laem Chabang' },
+    { key: 'etd', label: 'วันเรือออกตามแผน (ETD)', type: 'date', placeholder: '' },
+    { key: 'eta', label: 'วันเรือถึงตามแผน (ETA)', type: 'date', placeholder: '' },
+    { key: 'actual_departure', label: 'วันเรือออกจริง (Actual Departure)', type: 'date', placeholder: '' },
+    { key: 'actual_arrival', label: 'วันเรือถึงจริง (Actual Arrival)', type: 'date', placeholder: '' },
+    { key: 'warehouse_date', label: 'วันที่สินค้าเข้าโกดัง', type: 'date', placeholder: '' }
+  ];
+
+  return (
+    <div className="modalBg">
+      <div className="modal">
+        <h2>รายละเอียด Shipment / Vessel</h2>
+
+        <div className="form">
+          {fields.map(f => (
+            <div key={f.key}>
+              <label style={{ fontWeight: 800, fontSize: 13 }}>{f.label}</label>
+              <input
+                type={f.type}
+                placeholder={f.placeholder}
+                value={s[f.key] || ''}
+                onChange={e => setS({ ...s, [f.key]: e.target.value })}
+              />
+            </div>
+          ))}
+
+          <div className="full">
+            <label style={{ fontWeight: 800, fontSize: 13 }}>Timeline Shipment</label>
+            <textarea
+              placeholder="เช่น Supplier Confirm → Production → Booking → ETD → At Sea → ETA → Customs → Warehouse"
+              value={s.timeline || ''}
+              onChange={e => setS({ ...s, timeline: e.target.value })}
+            />
+          </div>
+
+          <div className="full">
+            <label style={{ fontWeight: 800, fontSize: 13 }}>Link อ้างอิง</label>
+            <textarea
+              placeholder="เช่น Google Drive, Booking, Tracking, PI, Invoice"
+              value={s.links || ''}
+              onChange={e => setS({ ...s, links: e.target.value })}
+            />
+          </div>
+
+          <div className="full">
+            <label style={{ fontWeight: 800, fontSize: 13 }}>หมายเหตุ</label>
+            <textarea
+              placeholder="เช่น Supplier แจ้งเลื่อนเรือ / รอเอกสาร / Container เปลี่ยน"
+              value={s.remark || ''}
+              onChange={e => setS({ ...s, remark: e.target.value })}
+            />
+          </div>
+        </div>
+
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <button className="btn light" onClick={onClose}>ยกเลิก</button>{' '}
+          <button className="btn orange" onClick={onSave}>💾 บันทึก Shipment</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ShipmentEventModal({ ev, setEv, ships, onClose, onSave }: any) {
+  return (
+    <div className="modalBg">
+      <div className="modal">
+        <h2>เพิ่ม / แก้ไข Shipment Event</h2>
+
+        <div className="form">
+          <div>
+            <label style={{ fontWeight: 800, fontSize: 13 }}>เลือก Shipment</label>
+            <select value={ev.shipment_id || ''} onChange={e => setEv({ ...ev, shipment_id: e.target.value })}>
+              <option value="">เลือก Shipment</option>
+              {ships.map((s: Shipment) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label style={{ fontWeight: 800, fontSize: 13 }}>วันที่เกิดเหตุการณ์</label>
+            <input type="date" value={ev.event_date || ''} onChange={e => setEv({ ...ev, event_date: e.target.value })} />
+          </div>
+
+          <div>
+            <label style={{ fontWeight: 800, fontSize: 13 }}>ประเภท Event</label>
+            <select value={ev.event_type || ''} onChange={e => setEv({ ...ev, event_type: e.target.value })}>
+              {shipmentEventTypes.map(x => <option key={x}>{x}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label style={{ fontWeight: 800, fontSize: 13 }}>หัวข้อ</label>
+            <input placeholder="เช่น เลื่อน ETD เป็น 24 มิ.ย. / รับของเข้าโกดังแล้ว" value={ev.title || ''} onChange={e => setEv({ ...ev, title: e.target.value })} />
+          </div>
+
+          <div className="full">
+            <label style={{ fontWeight: 800, fontSize: 13 }}>รายละเอียด</label>
+            <textarea placeholder="รายละเอียด เช่น เลื่อนเพราะเรือเต็ม / รับของบางส่วน / รอเอกสาร" value={ev.detail || ''} onChange={e => setEv({ ...ev, detail: e.target.value })} />
+          </div>
+        </div>
+
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <button className="btn light" onClick={onClose}>ยกเลิก</button>{' '}
+          <button className="btn orange" onClick={onSave}>💾 บันทึก Event</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LinkModal({ l, setL, onClose, onSave }: any) {
+  return (
+    <div className="modalBg">
+      <div className="modal">
+        <h2>เพิ่ม Files & Links</h2>
+
+        <div className="form">
+          <input placeholder="ชื่อ" value={l.title} onChange={e => setL({ ...l, title: e.target.value })} />
+          <input placeholder="URL" value={l.url || ''} onChange={e => setL({ ...l, url: e.target.value })} />
+          <input placeholder="ประเภท" value={l.ref_type || ''} onChange={e => setL({ ...l, ref_type: e.target.value })} />
+          <input placeholder="อ้างอิงงาน/Shipment" value={l.ref_name || ''} onChange={e => setL({ ...l, ref_name: e.target.value })} />
+          <textarea className="full" placeholder="หมายเหตุ" value={l.remark || ''} onChange={e => setL({ ...l, remark: e.target.value })} />
+        </div>
+
+        <div style={{ marginTop: 16, textAlign: 'right' }}>
+          <button className="btn light" onClick={onClose}>ปิด</button>{' '}
+          <button className="btn orange" onClick={onSave}>บันทึก</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Summary({ stats, min, setMin }: any) {
+  return (
+    <div className="widget">
+      <div className="widgetHead">
+        <b>📋 TOEY Workspace</b>
+        <button onClick={() => setMin(!min)}>{min ? 'เปิด' : 'ย่อ'}</button>
+      </div>
+
+      {!min && (
+        <div className="miniGrid">
+          <div className="mini">
+            <span>งานค้าง</span>
+            <div>{stats.pending}</div>
+          </div>
+          <div className="mini">
+            <span>วันนี้</span>
+            <div>{stats.today}</div>
+          </div>
+          <div className="mini">
+            <span>7 วัน</span>
+            <div>{stats.week}</div>
+          </div>
+          <div className="mini">
+            <span>Shipment</span>
+            <div>{stats.ship}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Calendar({ tasks, ships, events }: any) {
+  const [viewDate, setViewDate] = useState(new Date());
+
+  const y = viewDate.getFullYear();
+  const m = viewDate.getMonth();
+
+  const first = new Date(y, m, 1).getDay();
+  const days = new Date(y, m + 1, 0).getDate();
+
+  const cells: any[] = [];
+  for (let i = 0; i < first; i++) cells.push(null);
+  for (let d = 1; d <= days; d++) {
+    cells.push(toDateKey(new Date(y, m, d)));
+  }
+
+  function prevMonth() {
+    setViewDate(new Date(y, m - 1, 1));
+  }
+
+  function nextMonth() {
+    setViewDate(new Date(y, m + 1, 1));
+  }
+
+  function goToday() {
+    setViewDate(new Date());
+  }
+
+  function dayClass(date: string | null) {
+    if (!date) return 'day empty-day';
+
+    const dateObj = new Date(`${date}T00:00:00`);
+    const day = dateObj.getDay();
+    const isHoliday = holidays.some(h => h[0] === date);
+    const isToday = date === today();
+
+    let cls = 'day';
+
+    if (day === 0) cls += ' sunday-day';
+    if (day === 6) cls += ' saturday-day';
+    if (isHoliday) cls += ' holiday-day';
+    if (isToday) cls += ' today-day';
+
+    return cls;
+  }
+
+  return (
+    <div className="card">
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 14,
+          gap: 10
+        }}
+      >
+        <div>
+          <h3 style={{ margin: 0 }}>
+            Calendar -{' '}
+            {viewDate.toLocaleDateString('th-TH', {
+              month: 'long',
+              year: 'numeric'
+            })}
+          </h3>
+          <div className="sub">แสดงงาน, Shipment, Event, วันหยุด และเสาร์-อาทิตย์</div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn light" onClick={prevMonth}>← เดือนก่อน</button>
+          <button className="btn dark" onClick={goToday}>วันนี้</button>
+          <button className="btn light" onClick={nextMonth}>เดือนถัดไป →</button>
+        </div>
+      </div>
+
+      <div className="calendarLegend" style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+        <span className="legendBox holidayLegend">วันหยุดนักขัตฤกษ์</span>
+        <span className="legendBox saturdayLegend">วันเสาร์</span>
+        <span className="legendBox sundayLegend">วันอาทิตย์</span>
+        <span className="legendBox todayLegend">วันนี้</span>
+      </div>
+
+      <div className="calendar">
+        {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(x => (
+          <b key={x}>{x}</b>
+        ))}
+
+        {cells.map((date, i) => (
+          <div className={dayClass(date)} key={i}>
+            {date && (
+              <>
+                <small>{Number(date.slice(8, 10))}</small>
+
+                {holidays
+                  .filter(h => h[0] === date)
+                  .map(h => (
+                    <div className="holiday" key={h[1]}>
+                      🎌 {h[1]}
+                    </div>
+                  ))}
+
+                {tasks
+                  .filter((t: Task) => t.due_date === date)
+                  .map((t: Task) => (
+                    <div className="item" key={t.id}>
+                      ✅ {t.title}
+                    </div>
+                  ))}
+
+                {ships
+                  .filter((s: Shipment) => s.eta === date || s.etd === date || s.warehouse_date === date)
+                  .map((s: Shipment) => (
+                    <div className="item" key={s.id}>
+                      🚢 {s.name}
+                    </div>
+                  ))}
+
+                {events
+                  .filter((ev: ShipmentEvent) => ev.event_date === date)
+                  .map((ev: ShipmentEvent) => (
+                    <div className="item" key={ev.id}>
+                      📌 {ev.event_type}: {ev.title}
+                    </div>
+                  ))}
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <style jsx>{`
+        .holiday-day {
+          background: #fff1f2 !important;
+          border: 1px solid #fb7185 !important;
+        }
+
+        .saturday-day {
+          background: #eff6ff;
+        }
+
+        .sunday-day {
+          background: #fef2f2;
+        }
+
+        .today-day {
+          box-shadow: inset 0 0 0 2px #f59e0b;
+        }
+
+        .holiday {
+          background: #e11d48;
+          color: white;
+          padding: 3px 6px;
+          border-radius: 8px;
+          margin-top: 5px;
+          font-size: 11px;
+          font-weight: 700;
+        }
+
+        .item {
+          background: #111827;
+          color: white;
+          padding: 3px 6px;
+          border-radius: 8px;
+          margin-top: 5px;
+          font-size: 11px;
+        }
+
+        .legendBox {
+          display: inline-flex;
+          align-items: center;
+          padding: 5px 10px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 700;
+        }
+
+        .holidayLegend {
+          background: #fff1f2;
+          color: #be123c;
+          border: 1px solid #fb7185;
+        }
+
+        .saturdayLegend {
+          background: #eff6ff;
+          color: #1d4ed8;
+          border: 1px solid #93c5fd;
+        }
+
+        .sundayLegend {
+          background: #fef2f2;
+          color: #b91c1c;
+          border: 1px solid #fca5a5;
+        }
+
+        .todayLegend {
+          background: #fffbeb;
+          color: #b45309;
+          border: 1px solid #f59e0b;
+        }
+      `}</style>
+    </div>
+  );
+}
